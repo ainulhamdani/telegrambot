@@ -120,11 +120,162 @@ class TelegramModel extends CI_Model {
         return $this->exec_curl_request($handle);
     }
 
+    function updateUserPrev($user_id,$state){
+        $this->db->query("UPDATE status SET prev='$state' WHERE user_id=$user_id");
+    }
+    function updateUserNext($user_id,$state){
+        $this->db->query("UPDATE status SET next='$state' WHERE user_id=$user_id");
+    }
+    function updateUserQuestionType($user_id,$state){
+        $this->db->query("UPDATE status SET questiontype='$state' WHERE user_id=$user_id");
+    }
+    function saveResponse($prev,$type,$user_id,$response){
+        $query = "REPLACE INTO response
+            (questionKey,questionType,userId,response)
+        VALUES
+            (?,?,?,?);";
+        $this->db->query($query,[$prev,$type,$user_id,$response]);
+    }
+
+    function getQuestion($trigger,$user_id){
+        $status = $this->db->query("SELECT `questiontype`,`prev`, `next` FROM `status` WHERE `user_id`='$user_id'")->row();
+        
+        $filter = "";
+        if ($status->next != ''){
+            $filter .= " and `key` in ($status->next)";
+        }
+        if ($status->prev != ''){
+            $filter .= " and FIND_IN_SET('$status->prev',`prev`)";
+        }else{
+            $filter .= " and `prev` = ''";
+        }
+
+        if ($status->next != '' || $status->prev != ''){
+            $filter .= " and `type` = '$status->questiontype'";
+        }
+        
+        
+        $query = "SELECT question.id as id, question.key as qkey, question.type as type, question.prev as prev, question.next as next, question.message as message, question.answer as answer FROM question WHERE `trigger`='$trigger' $filter";
+        $return = $this->db->query($query)->row();
+        if ($return != null) {
+            return $return;
+        }
+
+        $query = "SELECT question.id as id, question.key as qkey, question.type as type, question.prev as prev, question.next as next, question.message as message, question.answer as answer FROM question WHERE `trigger`='' $filter";
+        $return = $this->db->query($query)->row();
+        if ($return != null) {
+            return $return;
+        }
+    }
+
     function processMessage($update) {
         $this->saveRawUpdate($update);
         if($this->isUpdateExist($update)){
             return;
         }
+        
+        if($update['callback_query'] != null) {
+            $message = $update['callback_query']["message"];
+            $message_id = $message['message_id'];
+            $chat_id = $message['chat']['id'];
+            $user_id = $message['chat']['id'];//pake yg chat
+            $text = $update['callback_query']['data'];
+        }else{
+            $message = $update["message"];
+            $message_id = $message['message_id'];
+            $chat_id = $message['chat']['id'];
+            $user_id = $message['from']['id'];
+            $text = $message['text'];
+        }
+
+        $status = $this->getUserStatus($user_id);
+        if($status != "registration_done"){
+            return $this->processMessageRegister($update);
+        }
+
+        if(isset($message['entities']) && isset($message['entities']['type'])){
+            //do nothing
+        }elseif (isset($message['text'])) {
+            // incoming text message
+            $this->saveMessage($message);
+
+
+            //dynamic question from db start here
+            $question = $this->getQuestion($text,$user_id);
+            if (strpos($text, "/reset") === 0) {
+                $this->updateUserPrev($user_id,'');//reset
+                $this->updateUserNext($user_id,'');//reset
+                $this->updateUserQuestionType($user_id,'');//reset
+                $sendMessage = array('chat_id' => $chat_id, "text" => "Reset success.");
+                $this->apiRequest("sendMessage", $sendMessage);
+                $this->saveBotMessage($message_id,$sendMessage);
+            }elseif($question != null){
+                $sendText = $question->message;
+                $sendMessage = array('chat_id' => $chat_id, "text" =>$sendText);
+                if($question->answer != null && $question->answer != ""){
+                    $sendMessage["reply_markup"] = json_decode($question->answer,true);
+                }
+                $this->apiRequestJson("sendMessage", $sendMessage);
+                $this->saveBotMessage($message_id,$sendMessage);
+
+                if($question->prev != ''){
+                    $userStatus = $this->getUserStatusComplete($user_id);
+                    $this->saveResponse($userStatus->prev,$userStatus->questiontype,$user_id,$text);//save answer if prev (id last question) exist;
+                }
+
+                $this->updateUserPrev($user_id,$question->qkey);// use id not prev, because it is the current state of user after finishing the question
+                $this->updateUserNext($user_id,$question->next);
+                $this->updateUserQuestionType($user_id,$question->type);
+                
+            }else{
+                $userStatus = $this->getUserStatusComplete($user_id);
+                // $this->apiRequest("sendMessage", $userStatus);
+                //     $this->saveBotMessage($message_id,$sendMessage);
+                if($userStatus->prev != '' && $userStatus->questiontype != ''){
+                    $this->saveResponse($userStatus->prev,$userStatus->questiontype,$user_id,$text);//save answer if prev (id last question) exist;
+                    $this->updateUserPrev($user_id,'');//reset
+                    $this->updateUserNext($user_id,'');//reset
+                    $this->updateUserQuestionType($user_id,'');//reset
+                    $sendMessage = array('chat_id' => $chat_id, "text" => "Selamat anda telah selesai menjawab pertanyan ".$userStatus->questiontype);
+                    $this->apiRequest("sendMessage", $sendMessage);
+                    $this->saveBotMessage($message_id,$sendMessage);
+                }else{
+                    $sendMessage = array('chat_id' => $chat_id, "text" => "There is invalid action. Please continue with the proper answer or try to /reset");
+                    $this->apiRequest("sendMessage", $sendMessage);
+                    $this->saveBotMessage($message_id,$sendMessage);
+                }
+            }
+
+            return;
+
+            //test purpose
+            $sendMessage = array('chat_id' => $chat_id, "text" => $message);
+            $this->apiRequest("sendMessage", $sendMessage);
+            $this->saveBotMessage($message_id,$sendMessage);
+            $sendMessage = array('chat_id' => $chat_id, "text" => $question);
+            $this->apiRequest("sendMessage", $sendMessage);
+            $this->saveBotMessage($message_id,$sendMessage);
+
+
+            return;
+
+            //debug purpose
+            $sendMessage = array('chat_id' => $chat_id, "text" => $message);
+            $this->apiRequest("sendMessage", $sendMessage);
+            $this->saveBotMessage($message_id,$sendMessage);
+            $sendMessage = array('chat_id' => $chat_id, "text" => $question);
+            $this->apiRequest("sendMessage", $sendMessage);
+            $this->saveBotMessage($message_id,$sendMessage);
+
+            return;
+        }
+    }
+
+    function processMessageRegister($update) {
+        // $this->saveRawUpdate($update);
+        // if($this->isUpdateExist($update)){
+        //     return;
+        // }
         $message = $update["message"];
         // process incoming message
         $message_id = $message['message_id'];
@@ -197,7 +348,7 @@ class TelegramModel extends CI_Model {
                     $sendMessage = array('chat_id' => $chat_id, "text" => 'Terima kasih! Saya akan menghubungi Anda lagi besok.', 'reply_markup' => array('hide_keyboard' => true));
                     $this->apiRequest("sendMessage", $sendMessage);
                     $this->saveBotMessage($message_id,$sendMessage);
-                    $this->updateUserStatus($user_id,"registration_done","survey_one");
+                    $this->updateUserStatus($user_id,"registration_done","");
                 } else if (strpos($text, "/stop") === 0) {
                     // stop now
                     $this->saveMessage($message);
@@ -213,7 +364,7 @@ class TelegramModel extends CI_Model {
                 $sendMessage = array('chat_id' => $chat_id, "text" => 'Terima kasih! Saya akan menghubungi Anda lagi besok.', 'reply_markup' => array('hide_keyboard' => true));
                 $this->apiRequest("sendMessage", $sendMessage);
                 $this->saveBotMessage($message_id,$sendMessage);
-                $this->updateUserStatus($user_id,"registration_done","survey_one");
+                $this->updateUserStatus($user_id,"registration_done","");
             } else {
                 $this->apiRequest("sendMessage", array('chat_id' => $chat_id, "text" => 'Jawaban yang anda kirimkan salah'));
             }
@@ -268,10 +419,6 @@ class TelegramModel extends CI_Model {
                 $this->saveMessage($message);
             }
         }
-
-
-
-
     }
 
     function saveRawUpdate($update){
@@ -398,6 +545,12 @@ class TelegramModel extends CI_Model {
 
         return "";
 
+    }
+
+    function getUserStatusComplete($user_id){
+        $query = "SELECT prev,next,questiontype FROM status WHERE  user_id=?";
+        $exec = $this->db->query($query, [$user_id]);
+        return $exec->row();
     }
 
     function updateUserStatus($user_id,$status,$next=""){
